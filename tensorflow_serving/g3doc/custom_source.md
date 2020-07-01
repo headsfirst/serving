@@ -56,7 +56,8 @@ loaded.
 simple way: it periodically inspects the file system (doing an `ls`,
 essentially), and if it finds one or more paths that look like servable
 versions it determines which one is the latest version and invokes the callback
-with a list of size one containing just that version. So, at any given time
+with a list of size one containing just that version
+(under the default configuration). So, at any given time
 `FileSystemStoragePathSource` requests at most one servable to be loaded, and
 its implementation takes advantage of the idempotence of the callback to keep
 itself stateless (there is no harm in invoking the callback repeatedly with the
@@ -101,7 +102,7 @@ Then, create a `SavedModelBundle` source adapter and plug it into the manager:
 
 ```c++
 std::unique_ptr<SavedModelBundleSourceAdapter> bundle_adapter;
-SessionBundleSourceAdapterConfig config;
+SavedModelBundleSourceAdapterConfig config;
 // ... populate 'config' with TensorFlow options.
 TF_CHECK_OK(SavedModelBundleSourceAdapter::Create(config, &bundle_adapter));
 ConnectSourceToTarget(bundle_adapter.get(), manager.get());

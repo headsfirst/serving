@@ -21,7 +21,7 @@ to simplify exposition). It offers a specific TensorFlow Session API, as well as
 lower-level APIs that can be used to batch at other granularities.
 
 The library is currently split across two locations:
-(1) tensorflow/contrib/batching (core API and implementation), and
+(1) core/kernels/batching_util (core API and implementation), and
 (2) tensorflow_serving/batching (higher-level and experimental code).
 
 The library offers several alternative classes to choose from. The reason for
@@ -74,7 +74,7 @@ some number of times with a delay; again, see below.
 
 A final configuration parameter is `allowed_batch_sizes`. This parameter is
 optional. If unset, then batch sizes can vary freely between 1 and the maximum
-allowed size, say 1024. Depending on your environment, having a large numbrer
+allowed size, say 1024. Depending on your environment, having a large number
 of possible batch sizes may cause problems. The `allowed_batch_sizes` parameter
 lets you limit the batch sizes to a fixed set, say 128, 256, 512, 1024.
 `BatchingSession` adheres to this restriction by padding invalid-size batches

@@ -16,6 +16,8 @@ limitations under the License.
 #include "tensorflow_serving/core/servable_state_monitor.h"
 
 #include "tensorflow/core/lib/core/notification.h"
+#include "tensorflow/core/lib/gtl/cleanup.h"
+#include "tensorflow_serving/core/servable_state.h"
 
 namespace tensorflow {
 namespace serving {
@@ -172,6 +174,24 @@ ServableStateMonitor::ServableMap ServableStateMonitor::GetLiveServableStates()
   return live_states_;
 }
 
+ServableStateMonitor::ServableSet
+ServableStateMonitor::GetAvailableServableStates() const {
+  ServableSet available_servable_set;
+  mutex_lock l(mu_);
+  for (const auto& live_state : live_states_) {
+    const string& servable_name = live_state.first;
+    const auto& version_map = live_state.second;
+    for (const auto& version : version_map) {
+      const ServableStateAndTime state_and_time = version.second;
+      if (state_and_time.state.manager_state ==
+          ServableState::ManagerState::kAvailable) {
+        available_servable_set.insert(servable_name);
+      }
+    }
+  }
+  return available_servable_set;
+}
+
 ServableStateMonitor::BoundedLog ServableStateMonitor::GetBoundedLog() const {
   mutex_lock l(mu_);
   return log_;
@@ -184,7 +204,12 @@ void ServableStateMonitor::NotifyWhenServablesReachState(
   mutex_lock l(mu_);
   servable_state_notification_requests_.push_back(
       {servables, goal_state, notifier_fn});
-  MaybeSendNotifications();
+  MaybeSendStateReachedNotifications();
+}
+
+void ServableStateMonitor::Notify(const NotifyFn& notify_fn) {
+  mutex_lock l(notify_mu_);
+  notify_fns_.push_back(notify_fn);
 }
 
 bool ServableStateMonitor::WaitUntilServablesReachState(
@@ -215,13 +240,16 @@ void ServableStateMonitor::HandleEvent(
     const EventBus<ServableState>::EventAndTime& event_and_time) {
   PreHandleEvent(event_and_time);
 
+  auto cleanup =
+      gtl::MakeCleanup([&]() { SendNotifications(event_and_time.event); });
+
   mutex_lock l(mu_);
   const ServableStateAndTime state_and_time = {
       event_and_time.event, event_and_time.event_time_micros};
   states_[state_and_time.state.id.name][state_and_time.state.id.version] =
       state_and_time;
   UpdateLiveStates(state_and_time, &live_states_);
-  MaybeSendNotifications();
+  MaybeSendStateReachedNotifications();
 
   if (options_.max_count_log_events == 0) {
     return;
@@ -233,7 +261,7 @@ void ServableStateMonitor::HandleEvent(
 }
 
 optional<std::pair<bool, std::map<ServableId, ServableState::ManagerState>>>
-ServableStateMonitor::ShouldSendNotification(
+ServableStateMonitor::ShouldSendStateReachedNotification(
     const ServableStateNotificationRequest& notification_request) {
   bool reached_goal_state = true;
   std::map<ServableId, ServableState::ManagerState> states_reached;
@@ -270,14 +298,14 @@ ServableStateMonitor::ShouldSendNotification(
   return {{reached_goal_state, states_reached}};
 }
 
-void ServableStateMonitor::MaybeSendNotifications() {
+void ServableStateMonitor::MaybeSendStateReachedNotifications() {
   for (auto iter = servable_state_notification_requests_.begin();
        iter != servable_state_notification_requests_.end();) {
     const ServableStateNotificationRequest& notification_request = *iter;
     const optional<
         std::pair<bool, std::map<ServableId, ServableState::ManagerState>>>
         opt_state_and_states_reached =
-            ShouldSendNotification(notification_request);
+            ShouldSendStateReachedNotification(notification_request);
     if (opt_state_and_states_reached) {
       notification_request.notifier_fn(opt_state_and_states_reached->first,
                                        opt_state_and_states_reached->second);
@@ -285,6 +313,14 @@ void ServableStateMonitor::MaybeSendNotifications() {
     } else {
       ++iter;
     }
+  }
+}
+
+void ServableStateMonitor::SendNotifications(
+    const ServableState& servable_state) {
+  mutex_lock l(notify_mu_);
+  for (const auto& notify_fn : notify_fns_) {
+    notify_fn(servable_state);
   }
 }
 

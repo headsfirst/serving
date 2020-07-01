@@ -32,20 +32,21 @@ import threading
 
 # This is a placeholder for a Google-internal import.
 
-from grpc.beta import implementations
+import grpc
 import numpy
 import tensorflow as tf
 
 from tensorflow_serving.apis import predict_pb2
-from tensorflow_serving.apis import prediction_service_pb2
+from tensorflow_serving.apis import prediction_service_pb2_grpc
 import mnist_input_data
 
 
-tf.app.flags.DEFINE_integer('concurrency', 1,
-                            'maximum number of concurrent inference requests')
-tf.app.flags.DEFINE_integer('num_tests', 100, 'Number of test images')
-tf.app.flags.DEFINE_string('server', '', 'PredictionService host:port')
-tf.app.flags.DEFINE_string('work_dir', '/tmp', 'Working directory. ')
+tf.compat.v1.app.flags.DEFINE_integer(
+    'concurrency', 1, 'maximum number of concurrent inference requests')
+tf.compat.v1.app.flags.DEFINE_integer('num_tests', 100, 'Number of test images')
+tf.compat.v1.app.flags.DEFINE_string('server', '',
+                                     'PredictionService host:port')
+tf.compat.v1.app.flags.DEFINE_string('work_dir', '/tmp', 'Working directory. ')
 FLAGS = tf.app.flags.FLAGS
 
 
@@ -137,9 +138,8 @@ def do_inference(hostport, work_dir, concurrency, num_tests):
     IOError: An error occurred processing test data set.
   """
   test_data_set = mnist_input_data.read_data_sets(work_dir).test
-  host, port = hostport.split(':')
-  channel = implementations.insecure_channel(host, int(port))
-  stub = prediction_service_pb2.beta_create_PredictionService_stub(channel)
+  channel = grpc.insecure_channel(hostport)
+  stub = prediction_service_pb2_grpc.PredictionServiceStub(channel)
   result_counter = _ResultCounter(num_tests, concurrency)
   for _ in range(num_tests):
     request = predict_pb2.PredictRequest()
@@ -147,7 +147,7 @@ def do_inference(hostport, work_dir, concurrency, num_tests):
     request.model_spec.signature_name = 'predict_images'
     image, label = test_data_set.next_batch(1)
     request.inputs['images'].CopyFrom(
-        tf.contrib.util.make_tensor_proto(image[0], shape=[1, image[0].size]))
+        tf.make_tensor_proto(image[0], shape=[1, image[0].size]))
     result_counter.throttle()
     result_future = stub.Predict.future(request, 5.0)  # 5 seconds
     result_future.add_done_callback(
@@ -168,4 +168,4 @@ def main(_):
 
 
 if __name__ == '__main__':
-  tf.app.run()
+  tf.compat.v1.app.run()

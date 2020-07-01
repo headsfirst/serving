@@ -63,7 +63,7 @@ class DynamicSourceRouter final : public SourceRouter<T> {
   const int num_output_ports_;
 
   mutable mutex routes_mu_;
-  Routes routes_ GUARDED_BY(routes_mu_);
+  Routes routes_ TF_GUARDED_BY(routes_mu_);
 
   TF_DISALLOW_COPY_AND_ASSIGN(DynamicSourceRouter);
 };
@@ -107,7 +107,7 @@ int DynamicSourceRouter<T>::Route(
     const StringPiece servable_name,
     const std::vector<ServableData<T>>& versions) {
   mutex_lock l(routes_mu_);
-  auto it = routes_.find(servable_name.ToString());
+  auto it = routes_.find(string(servable_name));
   if (it == routes_.end()) {
     LOG(INFO) << "Routing servable(s) from stream " << servable_name
               << " to default output port " << num_output_ports_ - 1;

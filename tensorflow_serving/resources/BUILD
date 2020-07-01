@@ -1,3 +1,5 @@
+load("//tensorflow_serving:serving.bzl", "serving_proto_library")
+
 package(
     default_visibility = [
         "//tensorflow_serving:internal",
@@ -19,14 +21,12 @@ filegroup(
     ),
 )
 
-load("//tensorflow_serving:serving.bzl", "serving_proto_library")
-
 serving_proto_library(
     name = "resources_proto",
     srcs = ["resources.proto"],
     cc_api_version = 2,
     visibility = ["//visibility:public"],
-    deps = ["@protobuf_archive//:cc_wkt_protos"],
+    deps = ["@com_google_protobuf//:cc_wkt_protos"],
 )
 
 cc_library(
@@ -44,7 +44,7 @@ cc_library(
     hdrs = ["resource_util.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":resources_proto",
+        ":resources_cc_proto",
         "@org_tensorflow//tensorflow/core:lib",
     ],
 )
@@ -57,6 +57,8 @@ cc_test(
         ":resource_util",
         "//tensorflow_serving/core/test_util:test_main",
         "//tensorflow_serving/test_util",
+        "@org_tensorflow//tensorflow/core:lib",
+        "@org_tensorflow//tensorflow/core:test",
     ],
 )
 
@@ -66,7 +68,7 @@ cc_library(
     hdrs = ["resource_tracker.h"],
     deps = [
         ":resource_util",
-        ":resources_proto",
+        ":resources_cc_proto",
         "//tensorflow_serving/core:loader",
         "@org_tensorflow//tensorflow/core:lib",
     ],

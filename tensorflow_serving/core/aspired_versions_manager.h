@@ -21,7 +21,7 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
-#include "tensorflow/contrib/batching/util/periodic_function.h"
+#include "tensorflow/core/kernels/batching_util/periodic_function.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/lib/hash/hash.h"
@@ -39,6 +39,7 @@ limitations under the License.
 #include "tensorflow_serving/core/servable_state.h"
 #include "tensorflow_serving/core/target.h"
 #include "tensorflow_serving/util/event_bus.h"
+#include "tensorflow_serving/util/observer.h"
 #include "tensorflow_serving/util/optional.h"
 
 namespace tensorflow {
@@ -50,10 +51,13 @@ namespace internal {
 
 class AspiredVersionsManagerTargetImpl;
 
-Status ConnectSourcesWithFastInitialLoad(
-    AspiredVersionsManager* manager,
-    std::vector<Source<std::unique_ptr<Loader>>*> sources,
-    const std::function<Status()>& wait_until_loaded_fn, uint32 num_threads);
+uint32 GetManagerNumLoadThreads(AspiredVersionsManager* manager);
+
+// Returns the Notifier function of the manager's Observer, which forwards
+// SetNumLoadThreads().  This indirection is to prevent callers from using
+// SetNumLoadThreads() on a deleted manager.
+std::function<void(uint32)> SetManagerNumLoadThreadsNotifier(
+    AspiredVersionsManager* manager);
 
 }  // namespace internal
 
@@ -122,6 +126,12 @@ class AspiredVersionsManager : public Manager,
     /// negative, we don't wait.
     /// Default: 1 minute.
     int64 load_retry_interval_micros = 1LL * 60 * 1000 * 1000;
+
+    // If true, and there are not multiple load threads, filesystem caches will
+    // be flushed after each servable is loaded. (Cache flush is skipped when
+    // multiple load threads are active, in order to avoid setting back a
+    // concurrent load on another thread.)
+    bool flush_filesystem_caches = false;
 
     /// The environment to use for starting threads in the thread-pool or for
     /// sleeping.
@@ -198,10 +208,10 @@ class AspiredVersionsManager : public Manager,
   friend class internal::AspiredVersionsManagerTargetImpl;
   friend class test_util::AspiredVersionsManagerTestAccess;
   friend class ServerCore;
-  friend Status internal::ConnectSourcesWithFastInitialLoad(
-      AspiredVersionsManager* manager,
-      std::vector<Source<std::unique_ptr<Loader>>*> sources,
-      const std::function<Status()>& wait_until_loaded_fn, uint32 num_threads);
+  friend uint32 internal::GetManagerNumLoadThreads(
+      AspiredVersionsManager* manager);
+  friend std::function<void(uint32)> internal::SetManagerNumLoadThreadsNotifier(
+      AspiredVersionsManager* manager);
 
   AspiredVersionsManager(
       int64 manage_state_interval_micros, Env* env,
@@ -220,7 +230,7 @@ class AspiredVersionsManager : public Manager,
   void EnqueueAspiredVersionsRequest(
       const StringPiece servable_name,
       std::vector<ServableData<std::unique_ptr<Loader>>> versions)
-      LOCKS_EXCLUDED(pending_aspired_versions_requests_mu_);
+      TF_LOCKS_EXCLUDED(pending_aspired_versions_requests_mu_);
 
   // Processes an aspired-versions request. It assumes the request doesn't
   // re-aspire any servables currently marked as not aspired in
@@ -228,41 +238,41 @@ class AspiredVersionsManager : public Manager,
   void ProcessAspiredVersionsRequest(
       const StringPiece servable_name,
       std::vector<ServableData<std::unique_ptr<Loader>>> versions)
-      EXCLUSIVE_LOCKS_REQUIRED(basic_manager_read_modify_write_mu_);
+      TF_EXCLUSIVE_LOCKS_REQUIRED(basic_manager_read_modify_write_mu_);
 
   // Determines whether an aspired-versions request contains any versions that
   // are currently being managed in 'basic_manager_' with is_aspired==false.
   bool ContainsAnyReaspiredVersions(
       const StringPiece servable_name,
       const std::vector<ServableData<std::unique_ptr<Loader>>>& versions) const
-      SHARED_LOCKS_REQUIRED(basic_manager_read_modify_write_mu_);
+      TF_SHARED_LOCKS_REQUIRED(basic_manager_read_modify_write_mu_);
 
   // Performs the action on the harness.
   void PerformAction(const AspiredVersionPolicy::ServableAction action)
-      EXCLUSIVE_LOCKS_REQUIRED(basic_manager_read_modify_write_mu_);
+      TF_EXCLUSIVE_LOCKS_REQUIRED(basic_manager_read_modify_write_mu_);
 
   // Goes through the harness map and calls the configured servable_policy with
   // the state snapshots to get a list of suggested actions. The actions are
   // then ordered and finally the topmost one is performed.
   optional<AspiredVersionPolicy::ServableAction> GetNextAction()
-      EXCLUSIVE_LOCKS_REQUIRED(basic_manager_read_modify_write_mu_);
+      TF_EXCLUSIVE_LOCKS_REQUIRED(basic_manager_read_modify_write_mu_);
 
   // Checks for servables that are not aspired and at some final state and tells
   // 'basic_manager_' to forget about them. This method is intended to be
   // invoked periodically, interleaved with InvokePolicyAndExecuteAction() and
   // HandlePendingAspiredVersionsRequests().
-  void FlushServables() LOCKS_EXCLUDED(basic_manager_read_modify_write_mu_);
+  void FlushServables() TF_LOCKS_EXCLUDED(basic_manager_read_modify_write_mu_);
 
   // Handles enqueued aspired-versions requests. This method is intended to be
   // invoked periodically, interleaved with InvokePolicyAndExecuteAction().
   void HandlePendingAspiredVersionsRequests()
-      LOCKS_EXCLUDED(basic_manager_read_modify_write_mu_,
-                     pending_aspired_versions_requests_mu_);
+      TF_LOCKS_EXCLUDED(basic_manager_read_modify_write_mu_,
+                        pending_aspired_versions_requests_mu_);
 
   // Invokes the aspired-version policy and executes any returned policy action.
   // This method is intended to be invoked periodically.
   void InvokePolicyAndExecuteAction()
-      LOCKS_EXCLUDED(basic_manager_read_modify_write_mu_);
+      TF_LOCKS_EXCLUDED(basic_manager_read_modify_write_mu_);
 
   // Sets the number of load threads.
   //
@@ -284,7 +294,7 @@ class AspiredVersionsManager : public Manager,
   using AspiredVersionsMap =
       std::map<string, std::vector<ServableData<std::unique_ptr<Loader>>>>;
   AspiredVersionsMap pending_aspired_versions_requests_
-      GUARDED_BY(pending_aspired_versions_requests_mu_);
+      TF_GUARDED_BY(pending_aspired_versions_requests_mu_);
   mutable mutex pending_aspired_versions_requests_mu_;
 
   // To lock basic_manager_ to perform atomic read/modify/write operations on
@@ -300,6 +310,10 @@ class AspiredVersionsManager : public Manager,
 
   // This is where the servables "live" while they are being managed.
   std::unique_ptr<BasicManager> basic_manager_;
+
+  // An observer object that forwards to SetNumLoadThreads(), if not detached.
+  // This is declared last here so that it is deleted before basic_manager_.
+  std::unique_ptr<Observer<const uint32>> set_num_load_threads_observer_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(AspiredVersionsManager);
 };

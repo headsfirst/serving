@@ -17,6 +17,7 @@ limitations under the License.
 #define TENSORFLOW_SERVING_CORE_TEST_UTIL_MOCK_SERVER_REQUEST_LOGGER_H_
 
 #include <string>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include "tensorflow_serving/core/server_request_logger.h"
@@ -29,13 +30,15 @@ class MockServerRequestLogger : public ServerRequestLogger {
  public:
   MockServerRequestLogger() : ServerRequestLogger({}) {}
 
-  MOCK_METHOD1(
-      Update,
-      Status(const std::map<string, LoggingConfig>& logging_config_map));
+  MOCK_METHOD(Status, Update,
+              ((const std::map<string, std::vector<LoggingConfig>>&
+                    logging_config_map)),
+              (override));
 
-  MOCK_METHOD3(Log, Status(const google::protobuf::Message& request,
-                           const google::protobuf::Message& response,
-                           const LogMetadata& log_metadata));
+  MOCK_METHOD(Status, Log,
+              (const google::protobuf::Message& request, const google::protobuf::Message& response,
+               const LogMetadata& log_metadata),
+              (override));
 };
 
 }  // namespace test_util

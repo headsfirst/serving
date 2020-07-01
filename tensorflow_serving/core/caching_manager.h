@@ -90,8 +90,11 @@ class CachingManager : public Manager {
     virtual ServableData<std::unique_ptr<Loader>> CreateLoader(
         const ServableId& servable_id) = 0;
 
-    /// Returns the latest version corresponding to the servable name.
-    virtual int64 GetLatestVersion(const string& servable_name) const = 0;
+    /// Returns a version corresponding to the servable name, for the given
+    /// policy.
+    virtual int64 GetServableVersion(
+        const string& servable_name,
+        ServableRequest::AutoVersionPolicy policy) const = 0;
   };
 
   static Status Create(Options options,
@@ -132,10 +135,10 @@ class CachingManager : public Manager {
   // basic-manager. All other requests block until the load completes and then
   // trivially succeed.
   Status LoadServable(ServableData<std::unique_ptr<Loader>> loader_data)
-      LOCKS_EXCLUDED(load_mutex_map_mu_);
+      TF_LOCKS_EXCLUDED(load_mutex_map_mu_);
 
   // Returns the size of the load_mutex_map_.
-  int64 GetLoadMutexMapSize() const LOCKS_EXCLUDED(load_mutex_map_mu_);
+  int64 GetLoadMutexMapSize() const TF_LOCKS_EXCLUDED(load_mutex_map_mu_);
 
   // Erases the entry from the map corresponding to the servable-id if there is
   // only one remaining reference to the mutex.
@@ -153,7 +156,7 @@ class CachingManager : public Manager {
   // a shared_ptr to allow for reference counting and consequent garbage
   // collection.
   std::map<ServableId, std::shared_ptr<mutex>> load_mutex_map_
-      GUARDED_BY(load_mutex_map_mu_);
+      TF_GUARDED_BY(load_mutex_map_mu_);
 
   TF_DISALLOW_COPY_AND_ASSIGN(CachingManager);
 };
@@ -170,7 +173,9 @@ class PathPrefixLoaderFactory : public CachingManager::LoaderFactory {
   ServableData<std::unique_ptr<Loader>> CreateLoader(
       const ServableId& id) override;
 
-  int64 GetLatestVersion(const string& servable_name) const override;
+  int64 GetServableVersion(
+      const string& servable_name,
+      ServableRequest::AutoVersionPolicy policy) const override;
 
  private:
   // The prefix of the path to the servables.

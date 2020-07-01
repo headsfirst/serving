@@ -17,25 +17,73 @@ limitations under the License.
 
 #include <stddef.h>
 
+#include "tensorflow/core/framework/cost_graph.pb.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/tensor_util.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/notification.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/lib/monitoring/percentile_sampler.h"
+#include "tensorflow/core/lib/monitoring/sampler.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/macros.h"
+#include "tensorflow/core/platform/threadpool_options.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/profiler/lib/traceme.h"
+#include "tensorflow/core/public/session.h"
+#include "tensorflow_serving/batching/batching_util.h"
 #include "tensorflow_serving/servables/tensorflow/serving_session.h"
 #include "tensorflow_serving/util/cleanup.h"
 #include "tensorflow_serving/util/hash.h"
-#include "tensorflow_serving/batching/batching_util.h"
-#include "tensorflow_serving/util/optional.h"
 
 namespace tensorflow {
 namespace serving {
 
 namespace {
+
+auto* queuing_latency = monitoring::Sampler<1>::New(
+    {"/tensorflow/serving/batching_session/queuing_latency",
+     "Distribution of wall time spent (in microseconds) in queuing",
+     "thread_pool_name"},
+    // Scale of 100, power of 1.2 with bucket count 52 (~1 second).
+    monitoring::Buckets::Exponential(100, 1.2, 52));
+
+// For all metrics: consider adding breakdowns based on model name or status if
+// needed. Note that model name is not available as a session property or on any
+// of the inputs currently.
+void RecordPaddingSize(int32 padding_size, int32 execution_batch_size) {
+  static auto* cell = tensorflow::monitoring::PercentileSampler<1>::New(
+      {"/tensorflow/serving/batching_session/padding_size",
+       "Tracks the padding size distribution on batches.",
+       "execution_batch_size"},
+      /*percentiles=*/{25.0, 50.0, 75.0, 90.0, 95.0, 99.0},
+      /*max_samples=*/1024, tensorflow::monitoring::UnitOfMeasure::kNumber);
+  cell->GetCell(absl::StrCat(execution_batch_size))
+      ->Add(static_cast<double>(padding_size));
+}
+
+void RecordInputBatchSize(int32 batch_size) {
+  static tensorflow::monitoring::PercentileSamplerCell* cell =
+      tensorflow::monitoring::PercentileSampler<0>::New(
+          {"/tensorflow/serving/batching_session/input_batch_size",
+           "Tracks the batch size distribution on the inputs."},
+          /*percentiles=*/{25.0, 50.0, 75.0, 90.0, 95.0, 99.0},
+          /*max_samples=*/1024, tensorflow::monitoring::UnitOfMeasure::kNumber)
+          ->GetCell();
+  cell->Add(static_cast<double>(batch_size));
+}
+
+void RecordProcessedBatchSize(int32 batch_size) {
+  static tensorflow::monitoring::PercentileSamplerCell* cell =
+      tensorflow::monitoring::PercentileSampler<0>::New(
+          {"/tensorflow/serving/batching_session/processed_batch_size",
+           "Tracks the batch size distribution on processing."},
+          /*percentiles=*/{25.0, 50.0, 75.0, 90.0, 95.0, 99.0},
+          /*max_samples=*/1024, tensorflow::monitoring::UnitOfMeasure::kNumber)
+          ->GetCell();
+  cell->Add(static_cast<double>(batch_size));
+}
 
 string TensorSignatureDebugString(const TensorSignature& signature) {
   return strings::StrCat("{input_tensors: <",
@@ -88,7 +136,7 @@ std::vector<std::vector<std::pair<string, Tensor>>> GetTaskInputsVector(
   std::vector<std::vector<std::pair<string, Tensor>>> all_task_inputs;
   for (int i = 0; i < batch.num_tasks(); ++i) {
     const std::vector<std::pair<string, Tensor>>& task_inputs =
-      *batch.task(i).inputs;
+        *batch.task(i).inputs;
     all_task_inputs.push_back(task_inputs);
   }
   return all_task_inputs;
@@ -97,7 +145,7 @@ std::vector<std::vector<std::pair<string, Tensor>>> GetTaskInputsVector(
 // the first (not zeroth) dimension.
 // For example, for shapes [1, 2, 3] and [4, 2, 3] the result is true.
 bool AreShapesEqualExceptZeroDim(const TensorShape& shape1,
-    const TensorShape& shape2) {
+                                 const TensorShape& shape2) {
   if (shape1.dims() != shape2.dims()) {
     return false;
   }
@@ -147,6 +195,7 @@ class BatchingSession : public ServingSession {
       const BatchingSessionOptions& options, std::unique_ptr<Session> wrapped,
       const std::vector<SignatureWithBatchingSessionSchedulerCreator>&
           signatures_with_scheduler_creators,
+      const std::string& thread_pool_name,
       std::unique_ptr<BatchingSession>* result);
 
   ~BatchingSession() override = default;
@@ -170,10 +219,30 @@ class BatchingSession : public ServingSession {
              const std::vector<string>& target_node_names,
              std::vector<Tensor>* outputs, RunMetadata* run_metadata) override;
 
+  // Similar to the function above, but takes an additional
+  // 'thread_pool_options' to pass to the underlying Session's Run(). We select
+  // an arbitrary 'thread_pool_options' (typically they are the same across
+  // calls).
+  Status Run(const RunOptions& run_options,
+             const std::vector<std::pair<string, Tensor>>& inputs,
+             const std::vector<string>& output_tensor_names,
+             const std::vector<string>& target_node_names,
+             std::vector<Tensor>* outputs, RunMetadata* run_metadata,
+             const thread::ThreadPoolOptions& thread_pool_options) override;
+
   Status ListDevices(std::vector<DeviceAttributes>* response) override;
 
  private:
-  explicit BatchingSession(const BatchingSessionOptions& options);
+  explicit BatchingSession(const BatchingSessionOptions& options,
+                           const std::string& thread_pool_name);
+
+  // Helper fucntion to run the session.
+  Status InternalRun(const RunOptions& run_options,
+                     const std::vector<std::pair<string, Tensor>>& inputs,
+                     const std::vector<string>& output_tensor_names,
+                     const std::vector<string>& target_node_names,
+                     std::vector<Tensor>* outputs, RunMetadata* run_metadata,
+                     optional<thread::ThreadPoolOptions> thread_pool_options);
 
   // Computes the size of an input tensor list for batching purposes, by
   // analyzing the 0th dimension size of each of the tensors. All tensors in the
@@ -202,6 +271,11 @@ class BatchingSession : public ServingSession {
                             const std::vector<Tensor>& combined_outputs,
                             Batch<BatchingSessionTask>* batch);
 
+  // Splits RunMetadata parts (e.g. costgraph attribution) into individual task
+  // outputs.
+  Status SplitRunMetadata(RunMetadata* batch_metadata,
+                          Batch<BatchingSessionTask>* batch);
+
   // Processes one batch of Run() calls with 'signature'. Called by
   // 'batch_scheduler_' in a batch thread.
   void ProcessBatch(const TensorSignature& signature,
@@ -214,6 +288,9 @@ class BatchingSession : public ServingSession {
                      std::unique_ptr<BatchScheduler<BatchingSessionTask>>,
                      HashTensorSignature, EqTensorSignature>
       batch_schedulers_;
+  // The name of the thread pool of the underlying batch scheduler. It is used
+  // for monitoring purpose, and can be empty if not known.
+  const std::string thread_pool_name_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(BatchingSession);
 };
@@ -222,9 +299,10 @@ Status BatchingSession::Create(
     const BatchingSessionOptions& options, std::unique_ptr<Session> wrapped,
     const std::vector<SignatureWithBatchingSessionSchedulerCreator>&
         signatures_with_scheduler_creators,
+    const std::string& thread_pool_name,
     std::unique_ptr<BatchingSession>* result) {
-  auto batching_session =
-      std::unique_ptr<BatchingSession>(new BatchingSession(options));
+  auto batching_session = std::unique_ptr<BatchingSession>(
+      new BatchingSession(options, thread_pool_name));
   BatchingSession* raw_batching_session = batching_session.get();
   batching_session->wrapped_ = std::move(wrapped);
 
@@ -263,11 +341,36 @@ Status BatchingSession::Run(
     const std::vector<string>& output_tensor_names,
     const std::vector<string>& target_node_names, std::vector<Tensor>* outputs,
     RunMetadata* run_metadata) {
+  return InternalRun(run_options, inputs, output_tensor_names,
+                     target_node_names, outputs, run_metadata, nullopt);
+}
+
+Status BatchingSession::Run(
+    const RunOptions& run_options,
+    const std::vector<std::pair<string, Tensor>>& inputs,
+    const std::vector<string>& output_tensor_names,
+    const std::vector<string>& target_node_names, std::vector<Tensor>* outputs,
+    RunMetadata* run_metadata,
+    const thread::ThreadPoolOptions& thread_pool_options) {
+  return InternalRun(run_options, inputs, output_tensor_names,
+                     target_node_names, outputs, run_metadata,
+                     thread_pool_options);
+}
+
+Status BatchingSession::InternalRun(
+    const RunOptions& run_options,
+    const std::vector<std::pair<string, Tensor>>& inputs,
+    const std::vector<string>& output_tensor_names,
+    const std::vector<string>& target_node_names, std::vector<Tensor>* outputs,
+    RunMetadata* run_metadata,
+    optional<thread::ThreadPoolOptions> thread_pool_options) {
   if (!target_node_names.empty()) {
     return errors::PermissionDenied(
         "BatchingSession does not support target nodes");
   }
 
+  profiler::TraceMe trace_me(
+      strings::StrCat("BatchingSessionRun:", thread_pool_name_));
   const TensorSignature signature =
       TensorSignatureFromRunArgs(inputs, output_tensor_names);
   auto batch_scheduler_it = batch_schedulers_.find(signature);
@@ -275,7 +378,7 @@ Status BatchingSession::Run(
     // We have a Run() call that doesn't match one of our batching signatures.
     // Run it in-line.
     static uint64 last_log_message_secs = 0;
-    uint64 now_secs = Env::Default()->NowSeconds();
+    uint64 now_secs = EnvTime::NowSeconds();
     // The time check is not strictly thread safe, but it doesn't matter.
     if (now_secs - last_log_message_secs >= 120) {
       LOG(WARNING) << "Request doesn't match any declared signature. Bypassing "
@@ -283,8 +386,17 @@ Status BatchingSession::Run(
                    << TensorSignatureDebugString(signature);
       last_log_message_secs = now_secs;
     }
-    return wrapped_->Run(run_options, inputs, output_tensor_names,
-                         target_node_names, outputs, run_metadata);
+    // Because the wrapped session may not provide an implementation for
+    // thread_pool_options, we need to invoke different Run() functions
+    // depending on whether thread_pool_options is specified.
+    if (thread_pool_options) {
+      return wrapped_->Run(run_options, inputs, output_tensor_names,
+                           target_node_names, outputs, run_metadata,
+                           thread_pool_options.value());
+    } else {
+      return wrapped_->Run(run_options, inputs, output_tensor_names,
+                           target_node_names, outputs, run_metadata);
+    }
   }
   BatchScheduler<BatchingSessionTask>* batch_scheduler =
       batch_scheduler_it->second.get();
@@ -294,7 +406,7 @@ Status BatchingSession::Run(
   Notification done;
   Status status;
   auto task = std::unique_ptr<BatchingSessionTask>(new BatchingSessionTask);
-  task->enqueue_time_micros = Env::Default()->NowMicros();
+  task->enqueue_time_micros = EnvTime::NowMicros();
   task->run_options = run_options;
   TF_RETURN_IF_ERROR(ComputeInputSize(inputs, &task->zeroth_dim_size));
   task->inputs = &inputs;
@@ -303,6 +415,7 @@ Status BatchingSession::Run(
   task->status = &status;
   task->outputs = outputs;
   task->run_metadata = run_metadata;
+  task->thread_pool_options = thread_pool_options;
 
   TF_RETURN_IF_ERROR(batch_scheduler->Schedule(&task));
   done.WaitForNotification();
@@ -313,12 +426,13 @@ Status BatchingSession::ListDevices(std::vector<DeviceAttributes>* response) {
   return wrapped_->ListDevices(response);
 }
 
-BatchingSession::BatchingSession(const BatchingSessionOptions& options)
-    : options_(options) {}
+BatchingSession::BatchingSession(const BatchingSessionOptions& options,
+                                 const std::string& thread_pool_name)
+    : options_(options), thread_pool_name_(thread_pool_name) {}
 
 Status BatchingSession::ComputeInputSize(
     const std::vector<std::pair<string, Tensor>>& inputs, size_t* size) const {
-  if (inputs.size() == 0) {
+  if (inputs.empty()) {
     return errors::InvalidArgument(
         "Batching session Run() must have at least one input tensor");
   }
@@ -344,6 +458,10 @@ Status BatchingSession::ComputeInputSize(
             "0th-dimension size");
       }
     }
+  }
+  for (const auto& entry : inputs) {
+    const Tensor& tensor = entry.second;
+    RecordInputBatchSize(tensor.shape().dim_size(0));
   }
   return Status::OK();
 }
@@ -371,8 +489,11 @@ Status BatchingSession::MergeInputTensors(
                             batch.num_tasks());
   }
 
-  const int padding_size =
-      RoundToLowestAllowedBatchSize(batch.size()) - batch.size();
+  const int lowest_allowed_batch_size =
+      RoundToLowestAllowedBatchSize(batch.size());
+  const int padding_size = lowest_allowed_batch_size - batch.size();
+  RecordPaddingSize(padding_size, lowest_allowed_batch_size);
+  RecordProcessedBatchSize(lowest_allowed_batch_size);
 
   // For each input tensor name, a vector of tensors from the individual tasks.
   std::map<string, std::vector<Tensor>> tensors_to_merge;
@@ -381,7 +502,7 @@ Status BatchingSession::MergeInputTensors(
   optional<std::map<string, std::vector<int>>> max_dim_sizes;
   if (options_.pad_variable_length_inputs) {
     std::vector<std::vector<std::pair<string, Tensor>>> all_task_inputs =
-      GetTaskInputsVector(batch);
+        GetTaskInputsVector(batch);
     max_dim_sizes = CalculateMaxDimSizes(all_task_inputs);
   }
   // Populate 'tensors_to_merge'.
@@ -403,18 +524,18 @@ Status BatchingSession::MergeInputTensors(
         // (except zeroth dim) when padding is turned off.
         if (i > 0) {  // added at least one task to tensors_to_merge
           TensorShape reference_shape =
-            tensors_to_merge[tensor_name][0].shape();
+              tensors_to_merge[tensor_name][0].shape();
           if (!AreShapesEqualExceptZeroDim(tensor.shape(), reference_shape)) {
             return errors::FailedPrecondition(
-              "Tensors with name '" + tensor_name + "' from different tasks" +
-              " have different shapes and padding is turned off." +
-              "Set pad_variable_length_inputs to true, or ensure that " +
-              "all tensors with the same name" +
-              "have equal dimensions starting with the first dim.");
+                "Tensors with name '" + tensor_name + "' from different tasks" +
+                " have different shapes and padding is turned off." +
+                "Set pad_variable_length_inputs to true, or ensure that " +
+                "all tensors with the same name" +
+                "have equal dimensions starting with the first dim.");
           }
         }
       }
-      tensor_vec.push_back(optionally_padded_tensor);
+      tensor_vec.push_back(std::move(optionally_padded_tensor));
       if (i == batch.num_tasks() - 1 && padding_size > 0) {
         // This is the last task. Insert padding.
         //
@@ -424,7 +545,7 @@ Status BatchingSession::MergeInputTensors(
         //
         // Slice() operates on the 0th dimension, which is the batch dimension.
         // It avoids a deep copy, which is a nice efficiency bonus.
-        const Tensor padding_tensor = optionally_padded_tensor.Slice(0, 1);
+        const Tensor padding_tensor = tensor_vec.back().Slice(0, 1);
         for (int i = 0; i < padding_size; ++i) {
           tensor_vec.push_back(padding_tensor);
         }
@@ -452,7 +573,7 @@ Status BatchingSession::MergeInputTensors(
       return errors::Internal("Tensor concat operation failed: ",
                               concat_status.ToString());
     }
-    merged_inputs->push_back({tensor_name, concated});
+    merged_inputs->push_back({tensor_name, std::move(concated)});
   }
 
   return Status::OK();
@@ -529,10 +650,35 @@ Status BatchingSession::SplitOutputTensors(
       if (split_tensor == split_tensors.end()) {
         return errors::Internal("Task does not conform to batch signature");
       }
-      task->outputs->push_back(split_tensor->second[i]);
+      task->outputs->push_back(std::move(split_tensor->second[i]));
     }
   }
   // (Ignore a possible final split_tensors entry containing the padding.)
+
+  return Status::OK();
+}
+
+Status BatchingSession::SplitRunMetadata(RunMetadata* batch_metadata,
+                                         Batch<BatchingSessionTask>* batch) {
+  if (batch->num_tasks() > 0) {
+    if (batch_metadata->has_cost_graph()) {
+      // Scale the batch aggregated to reflect the cost of an individual request
+      // in the batch; this assumes all requests in a batch have an equal cost.
+      for (size_t i = 0; i < batch_metadata->cost_graph().cost_size(); ++i) {
+        CostGraphDef_AggregatedCost* cost =
+            batch_metadata->mutable_cost_graph()->mutable_cost(i);
+        const float agg_cost = cost->cost();
+        cost->set_cost(agg_cost / static_cast<float>(batch->num_tasks()));
+      }
+    }
+
+    for (size_t i = 0; i < batch->num_tasks(); ++i) {
+      RunMetadata* run_metadata = batch->mutable_task(i)->run_metadata;
+      if (run_metadata != nullptr) {
+        *run_metadata = *batch_metadata;
+      }
+    }
+  }
 
   return Status::OK();
 }
@@ -549,7 +695,7 @@ void BatchingSession::ProcessBatch(
     return;
   }
 
-  const uint64 dequeue_time_micros = Env::Default()->NowMicros();
+  const uint64 dequeue_time_micros = EnvTime::NowMicros();
 
   // Regardless of the outcome, we need to propagate the status to the
   // individual tasks and signal that they are done. We use MakeCleanup() to
@@ -583,6 +729,8 @@ void BatchingSession::ProcessBatch(
         batch_deadline_micros = task_deadline_micros;
       }
     }
+    queuing_latency->GetCell(thread_pool_name_)
+        ->Add(dequeue_time_micros - task.enqueue_time_micros);
   }
   if (all_tasks_timeout_exceeded) {
     status = Status(error::RESOURCE_EXHAUSTED,
@@ -604,16 +752,27 @@ void BatchingSession::ProcessBatch(
     return;
   }
 
+  optional<thread::ThreadPoolOptions> thread_pool_options =
+      batch->task(0).thread_pool_options;
+
   const std::vector<string> output_tensor_names(
       signature.output_tensors.begin(), signature.output_tensors.end());
   std::vector<Tensor> combined_outputs;
   RunMetadata run_metadata;
-  status = wrapped_->Run(run_options, merged_inputs, output_tensor_names,
-                         {} /* target node names */, &combined_outputs,
-                         &run_metadata);
-  for (int i = 0; i < batch->num_tasks(); ++i) {
-    *(batch->mutable_task(i)->run_metadata) = run_metadata;
+  // Because the wrapped session may not provide an implementation for
+  // thread_pool_options, we need to invoke different Run() functions depending
+  // on whether thread_pool_options is specified.
+  if (thread_pool_options) {
+    status = wrapped_->Run(run_options, merged_inputs, output_tensor_names,
+                           {} /* target node names */, &combined_outputs,
+                           &run_metadata, thread_pool_options.value());
+  } else {
+    status = wrapped_->Run(run_options, merged_inputs, output_tensor_names,
+                           {} /* target node names */, &combined_outputs,
+                           &run_metadata);
   }
+  status.Update(SplitRunMetadata(&run_metadata, batch.get()));
+
   if (!status.ok()) {
     return;
   }
@@ -628,9 +787,9 @@ Status CreateBatchingSession(
     std::unique_ptr<Session> session,
     std::unique_ptr<Session>* batching_session) {
   std::unique_ptr<BatchingSession> internal_batching_session;
-  TF_RETURN_IF_ERROR(BatchingSession::Create(options, std::move(session),
-                                             signatures_with_scheduler_creators,
-                                             &internal_batching_session));
+  TF_RETURN_IF_ERROR(BatchingSession::Create(
+      options, std::move(session), signatures_with_scheduler_creators,
+      /*thread_pool_name=*/"", &internal_batching_session));
   *batching_session = std::move(internal_batching_session);
   return Status::OK();
 }
@@ -664,9 +823,14 @@ Status CreateBasicBatchingSession(
         *batch_scheduler = std::move(basic_batch_scheduler);
         return Status::OK();
       };
-  return CreateBatchingSession(batching_session_options,
-                               {{signature, scheduler_creator}},
-                               std::move(session), batching_session);
+
+  std::unique_ptr<BatchingSession> internal_batching_session;
+  TF_RETURN_IF_ERROR(BatchingSession::Create(
+      batching_session_options, std::move(session),
+      {{signature, scheduler_creator}}, schedule_options.thread_pool_name,
+      &internal_batching_session));
+  *batching_session = std::move(internal_batching_session);
+  return Status::OK();
 }
 
 }  // namespace serving

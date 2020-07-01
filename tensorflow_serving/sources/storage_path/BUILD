@@ -1,5 +1,8 @@
 # Description: Tensorflow Serving storage path sources.
 
+load("//tensorflow_serving:serving.bzl", "serving_proto_library")
+load("//tensorflow_serving:serving.bzl", "serving_proto_library_py")
+
 package(
     default_visibility = [
         "//tensorflow_serving:internal",
@@ -28,7 +31,7 @@ cc_library(
         "//visibility:public",
     ],
     deps = [
-        ":static_storage_path_source_proto",
+        ":static_storage_path_source_cc_proto",
         "//tensorflow_serving/core:servable_data",
         "//tensorflow_serving/core:servable_id",
         "//tensorflow_serving/core:source",
@@ -36,8 +39,6 @@ cc_library(
         "@org_tensorflow//tensorflow/core:lib",
     ],
 )
-
-load("//tensorflow_serving:serving.bzl", "serving_proto_library")
 
 serving_proto_library(
     name = "static_storage_path_source_proto",
@@ -69,14 +70,15 @@ cc_library(
     visibility = ["//visibility:public"],
     deps =
         [
-            ":file_system_storage_path_source_proto",
+            ":file_system_storage_path_source_cc_proto",
             "//tensorflow_serving/core:servable_data",
             "//tensorflow_serving/core:servable_id",
             "//tensorflow_serving/core:source",
             "//tensorflow_serving/core:storage_path",
-            "@org_tensorflow//tensorflow/contrib/batching/util:periodic_function",
+            "@com_google_absl//absl/types:variant",
             "@org_tensorflow//tensorflow/core:lib",
             "@org_tensorflow//tensorflow/core:tensorflow",
+            "@org_tensorflow//tensorflow/core/kernels/batching_util:periodic_function_dynamic",
         ],
 )
 
@@ -84,8 +86,13 @@ serving_proto_library(
     name = "file_system_storage_path_source_proto",
     srcs = ["file_system_storage_path_source.proto"],
     cc_api_version = 2,
-    go_api_version = 2,
     visibility = ["//visibility:public"],
+)
+
+serving_proto_library_py(
+    name = "file_system_storage_path_source_proto_py_pb2",
+    srcs = ["file_system_storage_path_source.proto"],
+    proto_library = "file_system_storage_path_source_proto",
 )
 
 cc_test(
@@ -96,7 +103,7 @@ cc_test(
         ],
     deps = [
         ":file_system_storage_path_source",
-        ":file_system_storage_path_source_proto",
+        ":file_system_storage_path_source_cc_proto",
         "//tensorflow_serving/core:servable_data",
         "//tensorflow_serving/core:target",
         "//tensorflow_serving/core/test_util:mock_storage_path_target",

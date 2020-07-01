@@ -17,7 +17,7 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "tensorflow/contrib/batching/test_util/fake_clock_env.h"
+#include "tensorflow/core/kernels/batching_util/fake_clock_env.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/platform/logging.h"
 
@@ -41,6 +41,10 @@ TEST(ServableStateMonitorTest, AddingStates) {
   monitor_options.max_count_log_events = 4;
 
   ServableStateMonitor monitor(bus.get(), monitor_options);
+  ServableState notified_state;
+  monitor.Notify([&](const ServableState& servable_state) {
+    notified_state = servable_state;
+  });
   EXPECT_FALSE(monitor.GetState(ServableId{"foo", 42}));
   EXPECT_TRUE(monitor.GetVersionStates("foo").empty());
   EXPECT_TRUE(monitor.GetAllServableStates().empty());
@@ -54,6 +58,7 @@ TEST(ServableStateMonitorTest, AddingStates) {
   bus->Publish(state_0);
   ASSERT_TRUE(monitor.GetState(ServableId{"foo", 42}));
   EXPECT_EQ(state_0, *monitor.GetState(ServableId{"foo", 42}));
+  EXPECT_EQ(state_0, notified_state);
   EXPECT_FALSE(monitor.GetState(ServableId{"foo", 99}));
   EXPECT_FALSE(monitor.GetState(ServableId{"bar", 42}));
   EXPECT_THAT(monitor.GetVersionStates("foo"),
@@ -75,6 +80,7 @@ TEST(ServableStateMonitorTest, AddingStates) {
   EXPECT_EQ(state_0, *monitor.GetState(ServableId{"foo", 42}));
   ASSERT_TRUE(monitor.GetState(ServableId{"foo", 43}));
   EXPECT_EQ(state_1, *monitor.GetState(ServableId{"foo", 43}));
+  EXPECT_EQ(state_1, notified_state);
   EXPECT_FALSE(monitor.GetState(ServableId{"foo", 99}));
   EXPECT_FALSE(monitor.GetState(ServableId{"bar", 42}));
   EXPECT_THAT(
@@ -101,6 +107,7 @@ TEST(ServableStateMonitorTest, AddingStates) {
   EXPECT_EQ(state_1, *monitor.GetState(ServableId{"foo", 43}));
   ASSERT_TRUE(monitor.GetState(ServableId{"bar", 7}));
   EXPECT_EQ(state_2, *monitor.GetState(ServableId{"bar", 7}));
+  EXPECT_EQ(state_2, notified_state);
   EXPECT_FALSE(monitor.GetState(ServableId{"bar", 42}));
   EXPECT_THAT(
       monitor.GetVersionStates("foo"),
@@ -242,6 +249,52 @@ TEST(ServableStateMonitorTest, GetLiveServableStates) {
   EXPECT_THAT(monitor.GetLiveServableStates(),
               UnorderedElementsAre(
                   Pair("bar", ElementsAre(Pair(7, state_1_and_time)))));
+}
+
+TEST(ServableStateMonitorTest, GetAvailableServableStates) {
+  test_util::FakeClockEnv env(Env::Default());
+  EventBus<ServableState>::Options bus_options;
+  bus_options.env = &env;
+  auto bus = EventBus<ServableState>::CreateEventBus(bus_options);
+  ServableStateMonitor monitor(bus.get());
+
+  const ServableState state_0 = {
+      ServableId{"foo", 42}, ServableState::ManagerState::kStart, Status::OK()};
+  env.AdvanceByMicroseconds(1);
+  const ServableStateAndTime state_0_and_time = {state_0, 1};
+  bus->Publish(state_0);
+  EXPECT_THAT(monitor.GetAvailableServableStates(), testing::IsEmpty());
+
+  env.AdvanceByMicroseconds(1);
+  std::vector<ServableStateAndTime> servable_state_and_time;
+  for (const auto& servable_id : {ServableId{"bar", 6}, ServableId{"bar", 7}}) {
+    const ServableState state = {
+        servable_id, ServableState::ManagerState::kAvailable, Status::OK()};
+    const ServableStateAndTime state_and_time = {state, 2};
+    servable_state_and_time.push_back({state, 2});
+    bus->Publish(state);
+  }
+
+  EXPECT_THAT(monitor.GetAvailableServableStates(),
+              UnorderedElementsAre("bar"));
+
+  // Servable {bar, 6} moves to state kUnloading and is removed from available
+  // servable states.
+  const ServableState state_0_update = {ServableId{"bar", 6},
+                                        ServableState::ManagerState::kUnloading,
+                                        Status::OK()};
+  env.AdvanceByMicroseconds(1);
+  bus->Publish(state_0_update);
+  EXPECT_THAT(monitor.GetAvailableServableStates(),
+              UnorderedElementsAre("bar"));
+  // Servable {bar, 7} moves to state kEnd and is removed from available
+  // servable states.
+  const ServableState state_1_update = {
+      ServableId{"bar", 7}, ServableState::ManagerState::kEnd, Status::OK()};
+  env.AdvanceByMicroseconds(1);
+  bus->Publish(state_1_update);
+  // No available state now.
+  EXPECT_THAT(monitor.GetAvailableServableStates(), ::testing::IsEmpty());
 }
 
 TEST(ServableStateMonitorTest, VersionMapDescendingOrder) {

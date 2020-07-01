@@ -1,5 +1,7 @@
 # Description: Tensorflow Serving core test utils.
 
+load("//tensorflow_serving:serving.bzl", "serving_proto_library")
+
 package(
     default_visibility = [
         "//tensorflow_serving:internal",
@@ -26,6 +28,7 @@ cc_library(
     testonly = 1,
     srcs = ["test_main.cc"],
     linkopts = ["-lm"],
+    tags = ["keep_dep"],  # Tell build_cleaner to keep dependencies on this.
     deps = [
         "@com_google_googletest//:gtest",
         "@org_tensorflow//tensorflow/core:testlib",
@@ -63,7 +66,7 @@ cc_library(
     hdrs = ["fake_loader_source_adapter.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":fake_loader_source_adapter_proto",
+        ":fake_loader_source_adapter_cc_proto",
         "//tensorflow_serving/core:loader",
         "//tensorflow_serving/core:simple_loader",
         "//tensorflow_serving/core:source_adapter",
@@ -72,8 +75,6 @@ cc_library(
     ],
     alwayslink = 1,
 )
-
-load("//tensorflow_serving:serving.bzl", "serving_proto_library")
 
 serving_proto_library(
     name = "fake_loader_source_adapter_proto",
@@ -152,8 +153,8 @@ cc_library(
     deps = [
         "//tensorflow_serving/core:log_collector",
         "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:lib",
-        "@protobuf_archive//:protobuf",
     ],
 )
 
@@ -164,8 +165,8 @@ cc_library(
     deps = [
         "//tensorflow_serving/core:log_collector",
         "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:lib",
-        "@protobuf_archive//:protobuf",
     ],
 )
 
@@ -174,11 +175,11 @@ cc_library(
     testonly = 1,
     hdrs = ["mock_request_logger.h"],
     deps = [
-        "//tensorflow_serving/core:logging_proto",
+        "//tensorflow_serving/core:logging_cc_proto",
         "//tensorflow_serving/core:request_logger",
         "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:lib",
-        "@protobuf_archive//:protobuf",
     ],
 )
 
@@ -202,4 +203,17 @@ cc_library(
         "@org_tensorflow//tensorflow/core:core_cpu",
         "@org_tensorflow//tensorflow/core:lib",
     ],
+)
+
+cc_library(
+    name = "session_test_util",
+    testonly = 1,
+    srcs = ["session_test_util.cc"],
+    hdrs = ["session_test_util.h"],
+    deps = [
+        "@org_tensorflow//tensorflow/core:core_cpu",
+        "@org_tensorflow//tensorflow/core:framework",
+        "@org_tensorflow//tensorflow/core:lib",
+    ],
+    alwayslink = 1,
 )
